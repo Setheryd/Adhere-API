@@ -1,5 +1,5 @@
 from typing import List
-from .. import models
+from ..... import models
 
 def process_x12_for_members(member_ids: List[str]) -> List[models.ProcessedMemberResult]:
     """

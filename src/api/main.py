@@ -1,6 +1,6 @@
 import uuid
 from fastapi import FastAPI, Body
-from . import models
+from .. import models
 from .services import x12_processor
 
 app = FastAPI(
