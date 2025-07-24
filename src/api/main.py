@@ -1,7 +1,7 @@
 import uuid
 from fastapi import FastAPI, Body
 from .. import models
-from .services import x12_processor
+from .endpoints import x12_processor # <-- CORRECTED LINE
 
 app = FastAPI(
     title="Adhere API",
@@ -22,8 +22,7 @@ async def create_processing_job(request: models.MemberProcessingRequest):
     """
     job_id = f"job_{uuid.uuid4()}"
 
-    # Call your service function to handle the business logic
-    processed_data = x12_processor.process_x12_for_members(
+    processed_data = await x12_processor.process_x12_for_members(
         member_ids=request.member_ids
     )
 
