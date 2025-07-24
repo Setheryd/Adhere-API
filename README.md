@@ -13,7 +13,7 @@ These steps will guide you through setting up the project in a properly encapsul
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repository-url>
+git clone <https://github.com/Setheryd/Adhere-API.git>
 cd Adhere-API
 ```
 
