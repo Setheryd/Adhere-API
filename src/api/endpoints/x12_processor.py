@@ -1,3 +1,5 @@
+# src/api/endpoints/x12_processor.py
+
 import os
 import httpx
 import uuid
@@ -5,150 +7,150 @@ import random
 from datetime import datetime
 from typing import List, Dict, Any
 
-# --- Import new parsers ---
 from requests_toolbelt.multipart import decoder
-from badx12 import Parser as X12Parser
-
 from ... import models
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Helper function (no changes) ---
-def generate_random_number(digits: int) -> int:
-    min_val = 10**(digits - 1)
-    max_val = (10**digits) - 1
-    return random.randint(min_val, max_val)
+def simple_x12_to_json(x12_string: str) -> List[Dict[str, Any]]:
+    """Converts a raw X12 string into a list of segment dictionaries."""
+    segments = []
+    for line in x12_string.strip().split('~'):
+        if line:
+            elements = line.strip().split('*')
+            segments.append({"segment_id": elements[0], "elements": elements[1:]})
+    return segments
 
-# --- Helper function (no changes) ---
-def generate_x12_payload(member_id: str) -> str:
-    now = datetime.utcnow()
-    date_str = now.strftime('%Y%m%d')
-    time_str = now.strftime('%H%M')
-    isa_date_str = now.strftime('%y%m%d')
-    
-    control_number = f"1000{generate_random_number(5)}"
-    group_control_number = str(generate_random_number(5))
-    transaction_id = f"1000{generate_random_number(4)}"
-    eligibility_date = date_str
+# src/api/endpoints/x12_processor.py
 
-    transaction_segments = [
-        f"ST*270*1240*005010X279A1~",
-        f"BHT*0022*13*{transaction_id}*{date_str}*{time_str}~",
-        f"HL*1**20*1~",
-        f"NM1*PR*2*INDIANA HEALTH COVERAGE PROGRAM*****PI*IHCP~",
-        f"HL*2*1*21*1~",
-        f"NM1*1P*2*ABSOLUTE CAREGIVERS LLC*****SV*300024773~",
-        f"HL*3*2*22*0~",
-        f"TRN*1*93175-012552-3*9877281234~",
-        f"NM1*IL*1******MI*{member_id}~",
-        f"DTP*291*D8*{eligibility_date}~",
-        f"EQ*30~"
-    ]
+def extract_final_result(member_id: str, parsed_x12: List[Dict[str, Any]]) -> models.FinalMemberResult:
+    """Processes the list of X12 segments to build the final, flat response object."""
+    patient_name = None
+    mce = None
+    waiver_status = "Ineligible"
+    coverage = None
+    start_date = None
+    end_date = None
 
-    se_segment = f"SE*{len(transaction_segments) + 1}*1240~"
-    
-    payload_segments = [
-        f"ISA*00*          *00*          *ZZ*A367           *ZZ*IHCP           *{isa_date_str}*{time_str}*^*00501*{control_number}*0*P*:~",
-        f"GS*HS*A367*IHCP*{date_str}*{time_str}*{group_control_number}*X*005010X279A1~",
-        *transaction_segments,
-        se_segment,
-        f"GE*1*{group_control_number}~",
-        f"IEA*1*{control_number}~"
-    ]
-    
-    return "\r\n".join(payload_segments)
+    primary_eb_index = -1
+    for i, segment in enumerate(parsed_x12):
+        if (segment["segment_id"] == "EB" and
+                len(segment["elements"]) > 4 and
+                segment["elements"][0] == '1' and
+                ("Waiver" in segment["elements"][4] or "HCBS" in segment["elements"][4])):
+            primary_eb_index = i
+            waiver_status = "Eligible"
+            coverage = segment["elements"][4]
+            break
 
-# --- NEW FUNCTION: To parse the server's response ---
-def parse_x12_response(response: httpx.Response) -> Dict[str, Any]:
-    """
-    Parses the multipart/form-data response to extract and structure
-    the X12 271 data.
-    """
-    try:
-        # Decode the multipart response using the response's headers
-        multipart_data = decoder.MultipartDecoder.from_response(response)
-        
-        parsed_response = {}
-        x12_payload_str = ""
+    if primary_eb_index != -1:
+        next_segment_index = primary_eb_index + 1
+        if next_segment_index < len(parsed_x12):
+            next_segment = parsed_x12[next_segment_index]
+            if next_segment["segment_id"] == "DTP" and len(next_segment["elements"]) > 2:
+                date_range = next_segment["elements"][2]
+                if '-' in date_range:
+                    parts = date_range.split('-')
+                    start_date, end_date = parts[0], parts[1]
+                else:
+                    start_date = date_range
 
-        # Extract data from each part of the multipart message
-        for part in multipart_data.parts:
-            # The header is bytes, so we decode it to a string to inspect it
-            header_content_disposition = part.headers.get(b'content-disposition', b'').decode('utf-8')
+    for segment in parsed_x12:
+        if segment["segment_id"] == "NM1" and len(segment["elements"]) > 1 and segment["elements"][0] == "IL":
+            # Defensive coding to prevent index errors
+            last_name = segment["elements"][2] if len(segment["elements"]) > 2 else ""
+            first_name = segment["elements"][3] if len(segment["elements"]) > 3 else ""
+            middle_initial = segment["elements"][4] if len(segment["elements"]) > 4 else ""
             
-            if 'name="Payload"' in header_content_disposition:
-                # This is the X12 data, decode it from bytes to a string
+            name_parts = [first_name, middle_initial] if middle_initial else [first_name]
+            patient_name = f"{last_name}, {' '.join(filter(None, name_parts))}"
+
+        if segment["segment_id"] == "NM1" and len(segment["elements"]) > 2 and segment["elements"][0] == "P5":
+            mce = segment["elements"][2]
+            
+    return models.FinalMemberResult(
+        member_id=member_id, patient=patient_name, waiver_status=waiver_status,
+        mce=mce, coverage=coverage, start_date=start_date, end_date=end_date,
+    )
+    
+def parse_and_extract(member_id: str, response: httpx.Response) -> models.FinalMemberResult:
+    """Parses the multipart response and extracts the final, clean result."""
+    try:
+        multipart_data = decoder.MultipartDecoder.from_response(response)
+        x12_payload_str = ""
+        for part in multipart_data.parts:
+            header_disp = part.headers.get(b'content-disposition', b'').decode('utf-8')
+            if 'name="Payload"' in header_disp:
                 x12_payload_str = part.text
-            elif 'name="ErrorCode"' in header_content_disposition:
-                parsed_response['error_code'] = part.text
-            elif 'name="ErrorMessage"' in header_content_disposition:
-                parsed_response['error_message'] = part.text
-
-        if x12_payload_str:
-            # If we found an X12 payload, parse it to JSON
-            x12_parser = X12Parser(x12_payload_str)
-            # The .to_dict() method provides a clean dictionary representation
-            parsed_response['x12_data'] = x12_parser.to_dict()
-        else:
-            # Handle cases where there might not be a payload (e.g., an initial error)
-            parsed_response['x12_data'] = None
-
-        return parsed_response
-
-    except Exception as e:
-        # If parsing fails for any reason, return the raw body for debugging
-        return {"parsing_error": str(e), "raw_body": response.text}
-
-
-# --- UPDATED FUNCTION: `send_270_request` to use the new parser ---
-async def send_270_request(member_id: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-    """Sends a single X12 270 request and returns the parsed response."""
-    domain = "coresvc.indianamedicaid.com"
-    url = f"https://{domain}/HP.Core.mime/CoreTransactions.aspx"
-    password = os.getenv("HCP_PASSWORD")
-
-    if not password:
-        return {
-            "member_id": member_id, "status": "error",
-            "details": {"error": "HCP_PASSWORD not found in environment variables."}
-        }
+                break
         
-    x12_payload = generate_x12_payload(member_id)
+        if x12_payload_str:
+            parsed_x12 = simple_x12_to_json(x12_payload_str)
+            return extract_final_result(member_id, parsed_x12)
+        else:
+            error_code, error_message = "Unknown", "No X12 Payload in Response"
+            for part in multipart_data.parts:
+                header_disp = part.headers.get(b'content-disposition', b'').decode('utf-8')
+                if 'name="ErrorCode"' in header_disp: error_code = part.text
+                if 'name="ErrorMessage"' in header_disp: error_message = part.text.strip()
+            return models.FinalMemberResult(member_id=member_id, waiver_status=f"Error: {error_code} - {error_message}")
+            
+    except Exception as e:
+        return models.FinalMemberResult(member_id=member_id, waiver_status=f"Error during parsing: {str(e)}")
+
+def generate_x12_payload(member_id: str) -> str:
+    """Generates the X12 270 request payload for a member."""
+    now = datetime.utcnow()
+    date_str, time_str, isa_date_str = now.strftime('%Y%m%d'), now.strftime('%H%M'), now.strftime('%y%m%d')
+    control_number = f"1000{random.randint(10000, 99999)}"
+    group_control_number = str(random.randint(10000, 99999))
+    transaction_id = f"1000{random.randint(1000, 9999)}"
+    
+    segments = [
+        "ST*270*1240*005010X279A1", f"BHT*0022*13*{transaction_id}*{date_str}*{time_str}",
+        "HL*1**20*1", "NM1*PR*2*INDIANA HEALTH COVERAGE PROGRAM*****PI*IHCP",
+        "HL*2*1*21*1", "NM1*1P*2*ABSOLUTE CAREGIVERS LLC*****SV*300024773",
+        "HL*3*2*22*0", "TRN*1*93175-012552-3*9877281234",
+        f"NM1*IL*1******MI*{member_id}", f"DTP*291*D8*{date_str}", "EQ*30"
+    ]
+    
+    full_segments = [
+        f"ISA*00*          *00*          *ZZ*A367           *ZZ*IHCP           *{isa_date_str}*{time_str}*^*00501*{control_number}*0*P*:",
+        f"GS*HS*A367*IHCP*{date_str}*{time_str}*{group_control_number}*X*005010X279A1",
+        *segments,
+        f"SE*{len(segments) + 1}*1240",
+        f"GE*1*{group_control_number}",
+        f"IEA*1*{control_number}"
+    ]
+    return "~".join(full_segments) + "~"
+
+async def send_270_request(member_id: str, client: httpx.AsyncClient) -> models.FinalMemberResult:
+    """Sends a single 270 request and returns a clean, final result object."""
+    url = "https://coresvc.indianamedicaid.com/HP.Core.mime/CoreTransactions.aspx"
+    password = os.getenv("HCP_PASSWORD")
+    if not password:
+        return models.FinalMemberResult(member_id=member_id, waiver_status="Error: HCP_PASSWORD not configured.")
 
     form_data = {
         'PayloadType': 'X12_270_Request_005010X279A1', 'ProcessingMode': 'RealTime',
-        'PayloadID': str(uuid.uuid4()), 'TimeStamp': datetime.utcnow().isoformat(),
-        'UserName': 'asll4982', 'Password': password, 'SenderID': 'A367',
-        'ReceiverID': 'IHCP', 'CORERuleVersion': '2.2.0',
+        'PayloadID': str(uuid.uuid4()), 'TimeStamp': datetime.utcnow().isoformat(), 'UserName': 'asll4982',
+        'Password': password, 'SenderID': 'A367', 'ReceiverID': 'IHCP', 'CORERuleVersion': '2.2.0',
     }
-    
-    files = {'Payload': ('payload.x12', x12_payload, 'text/plain')}
+    files = {'Payload': ('payload.x12', generate_x12_payload(member_id), 'text/plain')}
 
     try:
         response = await client.post(url, data=form_data, files=files, timeout=30.0)
-        response.raise_for_status() 
-        
-        # *** Call the new parsing function here! ***
-        parsed_details = parse_x12_response(response)
-        
-        return {
-            "member_id": member_id,
-            "status": "processed",
-            "details": parsed_details
-        }
-
+        response.raise_for_status()
+        return parse_and_extract(member_id, response)
     except httpx.RequestError as exc:
-        return {
-            "member_id": member_id, "status": "error",
-            "details": {"error": f"An error occurred while requesting {exc.request.url!r}.", "exception": str(exc)}
-        }
+        return models.FinalMemberResult(member_id=member_id, waiver_status=f"Error: Request failed - {exc}")
 
-# --- Main service function (no changes) ---
-async def process_x12_for_members(member_ids: List[str]) -> List[models.ProcessedMemberResult]:
+async def process_x12_for_members(member_ids: List[str]) -> List[models.FinalMemberResult]:
+    """Processes a list of member IDs and returns a list of final, clean results."""
     results = []
     async with httpx.AsyncClient() as client:
         for member_id in member_ids:
-            result_data = await send_270_request(member_id, client)
-            results.append(models.ProcessedMemberResult(**result_data))
+            result = await send_270_request(member_id, client)
+            results.append(result)
     return results
