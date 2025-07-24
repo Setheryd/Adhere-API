@@ -16,7 +16,7 @@ class FinalMemberResult(BaseModel):
 
 class MemberProcessingRequest(BaseModel):
     member_ids: List[str] = Field(..., example=[    "100000224499",
-    "100009208899",
+    "103271544199",
     "100031222199",
     "100034692299",
     "100047872599",

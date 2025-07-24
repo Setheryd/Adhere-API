@@ -28,7 +28,7 @@ def extract_final_result(member_id: str, parsed_x12: List[Dict[str, Any]]) -> mo
     """Processes the list of X12 segments to build the final, flat response object."""
     patient_name = None
     mce = None
-    waiver_status = "Ineligible"
+    waiver_status = "Not Eligible"
     coverage = None
     start_date = None
     end_date = None
