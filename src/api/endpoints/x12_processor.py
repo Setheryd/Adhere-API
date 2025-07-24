@@ -1,5 +1,3 @@
-# src/api/endpoints/x12_processor.py
-
 import os
 import httpx
 import uuid
@@ -7,23 +5,23 @@ import random
 from datetime import datetime
 from typing import List, Dict, Any
 
-# We will need the models for the response structure
-from ... import models
+# --- Import new parsers ---
+from requests_toolbelt.multipart import decoder
+from badx12 import Parser as X12Parser
 
-# Load environment variables (for the password)
+from ... import models
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# --- Helper function to generate random numbers ---
+# --- Helper function (no changes) ---
 def generate_random_number(digits: int) -> int:
-    """Generates a random number with a specific number of digits."""
     min_val = 10**(digits - 1)
     max_val = (10**digits) - 1
     return random.randint(min_val, max_val)
 
-# --- Function to generate the X12 270 payload for a single member ID ---
+# --- Helper function (no changes) ---
 def generate_x12_payload(member_id: str) -> str:
-    """Generates the X12 270 payload string for a given member ID."""
     now = datetime.utcnow()
     date_str = now.strftime('%Y%m%d')
     time_str = now.strftime('%H%M')
@@ -59,76 +57,98 @@ def generate_x12_payload(member_id: str) -> str:
         f"IEA*1*{control_number}~"
     ]
     
-    # The payload should be a single string with segments separated by newlines
     return "\r\n".join(payload_segments)
 
-# --- Function to send a single request ---
+# --- NEW FUNCTION: To parse the server's response ---
+def parse_x12_response(response: httpx.Response) -> Dict[str, Any]:
+    """
+    Parses the multipart/form-data response to extract and structure
+    the X12 271 data.
+    """
+    try:
+        # Decode the multipart response using the response's headers
+        multipart_data = decoder.MultipartDecoder.from_response(response)
+        
+        parsed_response = {}
+        x12_payload_str = ""
+
+        # Extract data from each part of the multipart message
+        for part in multipart_data.parts:
+            # The header is bytes, so we decode it to a string to inspect it
+            header_content_disposition = part.headers.get(b'content-disposition', b'').decode('utf-8')
+            
+            if 'name="Payload"' in header_content_disposition:
+                # This is the X12 data, decode it from bytes to a string
+                x12_payload_str = part.text
+            elif 'name="ErrorCode"' in header_content_disposition:
+                parsed_response['error_code'] = part.text
+            elif 'name="ErrorMessage"' in header_content_disposition:
+                parsed_response['error_message'] = part.text
+
+        if x12_payload_str:
+            # If we found an X12 payload, parse it to JSON
+            x12_parser = X12Parser(x12_payload_str)
+            # The .to_dict() method provides a clean dictionary representation
+            parsed_response['x12_data'] = x12_parser.to_dict()
+        else:
+            # Handle cases where there might not be a payload (e.g., an initial error)
+            parsed_response['x12_data'] = None
+
+        return parsed_response
+
+    except Exception as e:
+        # If parsing fails for any reason, return the raw body for debugging
+        return {"parsing_error": str(e), "raw_body": response.text}
+
+
+# --- UPDATED FUNCTION: `send_270_request` to use the new parser ---
 async def send_270_request(member_id: str, client: httpx.AsyncClient) -> Dict[str, Any]:
-    """Sends a single X12 270 request for one member ID."""
+    """Sends a single X12 270 request and returns the parsed response."""
     domain = "coresvc.indianamedicaid.com"
     url = f"https://{domain}/HP.Core.mime/CoreTransactions.aspx"
-    password = os.getenv("HCP_PASSWORD") # IMPORTANT: Make sure HCP_PASSWORD is in your .env file
+    password = os.getenv("HCP_PASSWORD")
 
     if not password:
         return {
-            "member_id": member_id,
-            "status": "error",
+            "member_id": member_id, "status": "error",
             "details": {"error": "HCP_PASSWORD not found in environment variables."}
         }
         
     x12_payload = generate_x12_payload(member_id)
 
-    # Mimic the form-data structure from the JS code
     form_data = {
-        'PayloadType': 'X12_270_Request_005010X279A1',
-        'ProcessingMode': 'RealTime',
-        'PayloadID': str(uuid.uuid4()),
-        'TimeStamp': datetime.utcnow().isoformat(),
-        'UserName': 'asll4982',
-        'Password': password,
-        'SenderID': 'A367',
-        'ReceiverID': 'IHCP',
-        'CORERuleVersion': '2.2.0',
+        'PayloadType': 'X12_270_Request_005010X279A1', 'ProcessingMode': 'RealTime',
+        'PayloadID': str(uuid.uuid4()), 'TimeStamp': datetime.utcnow().isoformat(),
+        'UserName': 'asll4982', 'Password': password, 'SenderID': 'A367',
+        'ReceiverID': 'IHCP', 'CORERuleVersion': '2.2.0',
     }
     
-    # The payload is sent as a file
     files = {'Payload': ('payload.x12', x12_payload, 'text/plain')}
 
     try:
-        # Send the POST request
-        response = await client.post(url, data=form_data, files=files, timeout=20.0)
-        
-        # Check if the request was successful
+        response = await client.post(url, data=form_data, files=files, timeout=30.0)
         response.raise_for_status() 
         
-        # Here you would parse the response.data (which is a string)
-        # For now, we just return a success message and the raw response
+        # *** Call the new parsing function here! ***
+        parsed_details = parse_x12_response(response)
+        
         return {
             "member_id": member_id,
             "status": "processed",
-            "details": {"response_status_code": response.status_code, "response_body": response.text}
+            "details": parsed_details
         }
 
     except httpx.RequestError as exc:
-        # Handle connection errors, timeouts, etc.
         return {
-            "member_id": member_id,
-            "status": "error",
+            "member_id": member_id, "status": "error",
             "details": {"error": f"An error occurred while requesting {exc.request.url!r}.", "exception": str(exc)}
         }
 
-# --- Main service function called by the API endpoint ---
+# --- Main service function (no changes) ---
 async def process_x12_for_members(member_ids: List[str]) -> List[models.ProcessedMemberResult]:
-    """
-    Processes a list of member IDs by sending X12 requests asynchronously.
-    """
     results = []
-    # Create an httpx client that can be reused for all requests
     async with httpx.AsyncClient() as client:
         for member_id in member_ids:
-            # Note: For real high-concurrency, you would use asyncio.gather here
-            # For simplicity, we process them sequentially but asynchronously.
             result_data = await send_270_request(member_id, client)
             results.append(models.ProcessedMemberResult(**result_data))
-            
     return results
